@@ -45,17 +45,27 @@
    ├── hosts.txt
    └── gosible.go
    ```
-2. 配置hosts.txt文件
+2. 参数说明
+
+   ```bash
+   --hosts hosts.txt：指定包含主机信息的文件路径。
+   --group group1：指定要操作的主机组名称。在这个例子中，我们选择了 group1。
+   --run "echo 'Hello World'"：指定要在每个主机上执行的命令。这里是简单的 echo 命令
+   ```
+3. 配置hosts.txt文件
 
    ```
    [root@llody-dev ~/go-build]#cat hosts.txt 
+   [group1]
    192.168.1.232:22:root:admin
    192.168.1.220:22:root:admin
+   [group2]
+   192.168.1.235:22:root:admin
    ```
-3. 文件下发 --copy
+4. 文件下发 --copy
 
    ```
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --copy "/root/go-build/go.mod:/opt/go.mod"
+   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --copy "/root/go-build/go.mod:/opt/go.mod"
    [192.168.1.220] 正在执行任务...
    Copying file /root/go-build/go.mod to host: 192.168.1.220:/opt/go.mod
    [192.168.1.232] 正在执行任务...
@@ -65,10 +75,10 @@
    File /root/go-build/go.mod copied to 192.168.1.232:/opt/go.mod
    [192.168.1.232] 任务完成
    ```
-4. 命令运行 --run
+5. 命令运行 --run
 
    ```
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --run "ls -lah /opt/ | grep go"
+   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --run "ls -lah /opt/ | grep go"
    [192.168.1.220] 正在执行任务...
    Checking host: 192.168.1.220
    [192.168.1.232] 正在执行任务...
@@ -82,7 +92,7 @@
 
    [192.168.1.232] 任务完成
 
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --run "sh demo.sh"
+   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --run "sh demo.sh"
    [192.168.1.220] 正在执行任务...
    Checking host: 192.168.1.220
    [192.168.1.232] 正在执行任务...
@@ -122,7 +132,7 @@
 
    [192.168.1.232] 任务完成
    ```
-5. 运行脚本
+6. 运行脚本
 
 #### 参与贡献
 

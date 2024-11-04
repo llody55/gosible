@@ -39,6 +39,10 @@ func main() {
 			Name:  "copy",
 			Usage: "Local and remote file paths to copy (e.g., /local/path:/remote/path)",
 		},
+		cli.StringFlag{
+			Name:  "group",
+			Usage: "Host group to execute command on",
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
@@ -48,11 +52,18 @@ func main() {
 		}
 		runCommand := c.String("run")
 		copyFiles := c.StringSlice("copy")
+		group := c.String("group")
 
 		// 读取 hosts 文件并解析主机信息
-		hosts, err := readHostsFile(hostsFile)
+		groups, err := readHostsFile(hostsFile)
 		if err != nil {
 			log.Fatal(err)
+		}
+
+		// 获取指定的主机组
+		hosts, ok := groups[group]
+		if !ok {
+			return cli.NewExitError("指定的组不存在", 1)
 		}
 
 		// 创建一个 WaitGroup 来等待所有巡检任务完成
@@ -64,10 +75,9 @@ func main() {
 		// 创建一个通道来控制并发执行
 		concurrency := make(chan struct{}, maxConcurrency)
 
-		// 遍历主机列表，为每个主机启动一个 Goroutine
+		// 遍历组内主机列表，为每个主机启动一个 Goroutine
 		for _, host := range hosts {
 
-			// 这里新增了并发限制
 			concurrency <- struct{}{} // 占用一个并发槽位
 
 			wg.Add(1)
@@ -99,9 +109,10 @@ func main() {
 	}
 }
 
-// 读取hosts.txt文件并解析出字段
-func readHostsFile(filename string) ([]HostInfo, error) {
-	var hosts []HostInfo
+// 读取hosts文件并解析组信息
+func readHostsFile(filename string) (map[string][]HostInfo, error) {
+	groups := make(map[string][]HostInfo)
+	var currentGroup string
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -111,16 +122,27 @@ func readHostsFile(filename string) ([]HostInfo, error) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, ":")
-		if len(parts) == 4 {
-			hostInfo := HostInfo{
-				IP:       parts[0],
-				Port:     parts[1],
-				Username: parts[2],
-				Password: parts[3],
+		line := strings.TrimSpace(scanner.Text())
+		// 跳过空行
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			// 解析组名
+			currentGroup = line[1 : len(line)-1]
+			groups[currentGroup] = []HostInfo{}
+		} else {
+			// 解析主机信息
+			parts := strings.Split(line, ":")
+			if len(parts) == 4 {
+				hostInfo := HostInfo{
+					IP:       parts[0],
+					Port:     parts[1],
+					Username: parts[2],
+					Password: parts[3],
+				}
+				groups[currentGroup] = append(groups[currentGroup], hostInfo)
 			}
-			hosts = append(hosts, hostInfo)
 		}
 	}
 
@@ -128,7 +150,7 @@ func readHostsFile(filename string) ([]HostInfo, error) {
 		return nil, err
 	}
 
-	return hosts, nil
+	return groups, nil
 }
 
 // 用于解析 copyFiles 的内容，并从中获取本地路径和远程路径。
