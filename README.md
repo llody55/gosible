@@ -1,146 +1,96 @@
-# gosible
+# Gosible v2.0
 
-#### 介绍
+**Gosible** 是一款基于 Go 语言开发的轻量级运维自动化工具。它旨在提供类似 Ansible 的批量任务执行与文件分发能力，但摒弃了复杂的依赖和冗长的 DSL，通过一个极简的二进制文件即可实现高效的万台机器管理。
 
-使用 Golang 语言编写的基于 SSH 协议的工具，旨在执行远程主机文件分发和命令执行功能。
+## 🚀 v2.0 新特性
 
-#### [下载地址](https://github.com/llody55/gosible/releases)
+* **层级配置覆盖 (Hierarchical Vars):** 支持 `Global -> Group -> Host` 三级变量覆盖。你可以为特定主机定制差异化的端口、用户或密码。
+* **并发/顺序控制:** 引入 `-f (forks)` 参数。支持百级并发加速，或针对核心业务进行 `-f 1` 的严格顺序部署。
+* **递归目录同步:** 内置 SFTP 逻辑，支持文件夹递归下发，并自动保持本地文件的  **权限 (Mode)** 。
+* **智能输出模式:** * `status` 模式：简洁的实时进度条，适合大规模并发。
+  * `detail` 模式：实时查看每台主机的标准输出，适合调试。
+* **安全保障:** 引入 `-t (timeout)` 任务超时控制，防止因单台机器网络僵死导致整体任务挂起。
+* **目标过滤:** 支持 `-l (limit)` 参数，无需修改配置文件即可临时过滤执行目标（IP 或组名）。
 
-### 功能概述
+---
 
-1. **主机信息解析** ：
+## 🛠 安装与部署
 
-* 从指定的文件中读取主机信息（IP、端口、用户名、密码），并将其解析为 `HostInfo` 结构体。
+### 1. 编译安装
 
-  2.**并发执行** ：
-* 采用并发模型，允许并行处理多个主机上的任务。通过 `sync.WaitGroup` 控制并发数量，避免过载远程主机。
-* 使用 `sync.WaitGroup` 和通道来管理并发执行的主机任务数量，以避免过度消耗资源。
+```bash
+git clone https://github.com/llody55/gosible
+cd gosible
+CGO_ENABLED=0 go build -ldflags="-s -w" -o gosible gosible.go
+sudo mv gosible /usr/local/bin/
+```
 
-  3.**文件传输** ：
-* 使用 SSH 和 SFTP 客户端（`golang.org/x/crypto/ssh` 和 `github.com/pkg/sftp` 包）实现文件在本地和远程主机之间的传输。
-* `copyFileUsingSFTP` 函数负责文件传输。该函数通过 SSH 连接创建 SFTP 客户端，并将本地文件复制到远程主机。
+---
 
-  4.**远程命令执行** ：
-* 提供功能以执行指定的命令或脚本文件在远程主机上。`checkHost` 函数使用 SSH 连接执行特定命令，并返回结果。
+## 📖 使用指南
 
-  5.**命令行参数** ：
-* 通过命令行参数指定主机文件路径、远程命令、以及要复制的文件路径。
+### 1. 配置 Inventory (config.yaml)
 
-### 结构和主要函数
+支持灵活的分组与变量嵌套：
 
-* `HostInfo` 结构体：存储远程主机的连接信息（IP、端口、用户名、密码）。
-* `main` 函数：程序入口，处理命令行参数，读取主机信息，然后并发执行文件传输和远程命令执行任务。
-* `readHostsFile` 函数：从文件中读取主机信息并解析成 `HostInfo` 结构体。
-* `splitPaths` 函数：用于解析文件传输参数，提取本地路径和远程路径。
-* `copyFileUsingSFTP` 函数：通过 SFTP 客户端实现文件传输。
-* `checkHost` 函数：建立 SSH 连接并执行远程命令或脚本。
+```yaml
+all:
+  vars:
+    user: "root"                   # 全局账户
+    password: "default_password"   # 全局密码
+    port: 22                       # 全局端口
+  groups:
+    web_cluster:
+      hosts:
+        192.168.1.10: {}
+        192.168.1.11:
+          vars:
+            user: "root"
+            password: "admin"
+            port: 2222  # 局部覆盖全局端口,自定义端口号
+    db_cluster:
+      vars:
+        user: "root"
+        password: "db_password" # 组局部变量覆盖
+        port: 2222
+      hosts:
+        192.168.1.20: {}
+```
 
-#### 使用说明
+### 2. 常用命令示例
 
-1. 目录结构
+* **批量检查系统负载 (50 并发):**
 
-   ```
-   ├── go.mod
-   ├── go.sum
-   ├── hosts.txt
-   └── gosible.go
-   ```
-2. 参数说明
+  ```bash
+  gosible -i config.yaml -f 50 -m exec -a "uptime"
+  ```
+* **递归同步配置目录 (顺序执行 + 详细输出):**
 
-   ```bash
-   --hosts hosts.txt：指定包含主机信息的文件路径。
-   --group group1：指定要操作的主机组名称。在这个例子中，我们选择了 group1。
-   --run "echo 'Hello World'"：指定要在每个主机上执行的命令。这里是简单的 echo 命令
-   ```
-3. 配置hosts.txt文件
+  ```bash
+  gosible -i config.yaml -f 1 -m copy -src "./configs" -dst "/etc/app/conf" -o detail
+  ```
+* **针对特定组执行并设置 10秒超时:**
 
-   ```
-   [root@llody-dev ~/go-build]#cat hosts.txt 
-   [group1]
-   192.168.1.232:22:root:admin
-   192.168.1.220:22:root:admin
-   [group2]
-   192.168.1.235:22:root:admin
-   ```
-4. 文件下发 --copy
+  ```bash
+  gosible -i config.yaml -l web_cluster -t 10s -a "systemctl restart nginx"
+  ```
 
-   ```
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --copy "/root/go-build/go.mod:/opt/go.mod"
-   [192.168.1.220] 正在执行任务...
-   Copying file /root/go-build/go.mod to host: 192.168.1.220:/opt/go.mod
-   [192.168.1.232] 正在执行任务...
-   Copying file /root/go-build/go.mod to host: 192.168.1.232:/opt/go.mod
-   File /root/go-build/go.mod copied to 192.168.1.220:/opt/go.mod
-   [192.168.1.220] 任务完成
-   File /root/go-build/go.mod copied to 192.168.1.232:/opt/go.mod
-   [192.168.1.232] 任务完成
-   ```
-5. 命令运行 --run
+---
 
-   ```
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --run "ls -lah /opt/ | grep go"
-   [192.168.1.220] 正在执行任务...
-   Checking host: 192.168.1.220
-   [192.168.1.232] 正在执行任务...
-   Checking host: 192.168.1.232
-   Result from 192.168.1.220:
-   -rw-r--r--   1 root root  401 Oct 30 13:40 go.mod
+## 📊 参数说明
 
-   [192.168.1.220] 任务完成
-   Result from 192.168.1.232:
-   -rw-r--r--   1 root root 401 10月 30 13:40 go.mod
+| **参数** | **说明**                                       | **默认值** |
+| -------------- | ---------------------------------------------------- | ---------------- |
+| `-i`         | Inventory 配置文件路径                               | `config.yaml`  |
+| `-f`         | 并发数 (Forks)，设置为 1 则为顺序执行,否则并发执行   | `5`            |
+| `-m`         | 任务模式：`exec`(执行命令) 或 `copy`(分发文件)   | `exec`         |
+| `-o`         | 输出模式：`status`(进度条) 或 `detail`(详细结果) | `status`       |
+| `-t`         | 任务超时时间 (如: 10s, 5m, 1h)                       | `30s`          |
+| `-l`         | 目标过滤，支持指定 IP 或组名                         | (空)             |
+| `-src/dst`   | 文件分发的源路径与目标路径                           | (空)             |
 
-   [192.168.1.232] 任务完成
+## 🤝 贡献与反馈
 
-   [root@llody-dev ~/go-build]#gosible --hosts ./hosts.txt --group group1 --run "sh demo.sh"
-   [192.168.1.220] 正在执行任务...
-   Checking host: 192.168.1.220
-   [192.168.1.232] 正在执行任务...
-   Checking host: 192.168.1.232
-   Result from 192.168.1.220:
+欢迎提交 Issue 或 Pull Request！
 
-                ┏┓      ┏┓
-               ┏┛┻━━━━━━┛┻┓
-               ┃               ☃           ┃
-               ┃  ┳┛   ┗┳ ┃
-               ┃     ┻    ┃
-               ┗━┓      ┏━┛
-                 ┃      ┗━━━━━┓
-                 ┃  神兽保佑     ┣┓
-                 ┃ 永无BUG！     ┏┛
-                 ┗┓┓┏━┳┓┏━━━━━┛
-                  ┃┫┫ ┃┫┫
-                  ┗┻┛ ┗┻┛
-
-
-   [192.168.1.220] 任务完成
-   Result from 192.168.1.232:
-
-                ┏┓      ┏┓
-               ┏┛┻━━━━━━┛┻┓
-               ┃               ☃           ┃
-               ┃  ┳┛   ┗┳ ┃
-               ┃     ┻    ┃
-               ┗━┓      ┏━┛
-                 ┃      ┗━━━━━┓
-                 ┃  神兽保佑     ┣┓
-                 ┃ 永无BUG！     ┏┛
-                 ┗┓┓┏━┳┓┏━━━━━┛
-                  ┃┫┫ ┃┫┫
-                  ┗┻┛ ┗┻┛
-
-
-   [192.168.1.232] 任务完成
-   ```
-6. 运行脚本
-
-#### 参与贡献
-
-1. Fork 本仓库
-2. 新建 Feat_xxx 分支
-3. 提交代码
-4. 新建 Pull Request
-
-#### 特技
-
-1. 目前实现功能有文件批量下发，脚本批量执行。
+项目地址: https://github.com/llody55/gosible

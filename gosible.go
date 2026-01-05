@@ -1,257 +1,206 @@
 package main
 
 import (
-	"bufio"
+	"context"
+	"flag"
 	"fmt"
 	"io"
-	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
-type HostInfo struct {
+// --- 数据模型 ---
+
+type Inventory struct {
+	All struct {
+		Vars   map[string]interface{} `yaml:"vars"`
+		Groups map[string]struct {
+			Vars  map[string]interface{} `yaml:"vars"`
+			Hosts map[string]map[string]interface{} `yaml:"hosts"`
+		} `yaml:"groups"`
+	} `yaml:"all"`
+}
+
+type Target struct {
 	IP       string
-	Port     string
-	Username string
+	Port     int
+	User     string
 	Password string
 }
 
-// 主方法
-func main() {
-	app := cli.NewApp()
-	app.Name = "SSH Tool"
-	app.Usage = "Tool for SSH-based host inspection and file copy"
-	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "hosts",
-			Usage: "Path to the hosts file",
-		},
-		cli.StringFlag{
-			Name:  "run",
-			Usage: "Command or script to run on hosts",
-		},
-		cli.StringSliceFlag{
-			Name:  "copy",
-			Usage: "Local and remote file paths to copy (e.g., /local/path:/remote/path)",
-		},
-		cli.StringFlag{
-			Name:  "group",
-			Usage: "Host group to execute command on",
-		},
+var (
+	successCount int32
+	failCount    int32
+	printMutex   sync.Mutex // 确保输出不冲突
+)
+
+// --- 配置合并逻辑 ---
+
+func getDeepVal(hostMap map[string]interface{}, groupVars map[string]interface{}, globalVars map[string]interface{}, key string, fallback interface{}) interface{} {
+	if v, ok := hostMap["vars"]; ok {
+		if vm, ok := v.(map[string]interface{}); ok {
+			if val, ok := vm[key]; ok { return val }
+		}
 	}
-
-	app.Action = func(c *cli.Context) error {
-		hostsFile := c.String("hosts")
-		if hostsFile == "" {
-			return cli.NewExitError("请指定你的hosts文件", 1)
-		}
-		runCommand := c.String("run")
-		copyFiles := c.StringSlice("copy")
-		group := c.String("group")
-
-		// 读取 hosts 文件并解析主机信息
-		groups, err := readHostsFile(hostsFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// 获取指定的主机组
-		hosts, ok := groups[group]
-		if !ok {
-			return cli.NewExitError("指定的组不存在", 1)
-		}
-
-		// 创建一个 WaitGroup 来等待所有巡检任务完成
-		var wg sync.WaitGroup
-
-		// 设置最大并发数量
-		maxConcurrency := 5
-
-		// 创建一个通道来控制并发执行
-		concurrency := make(chan struct{}, maxConcurrency)
-
-		// 遍历组内主机列表，为每个主机启动一个 Goroutine
-		for _, host := range hosts {
-
-			concurrency <- struct{}{} // 占用一个并发槽位
-
-			wg.Add(1)
-			go func(hostInfo HostInfo, cmd string, copyFiles []string) {
-				defer func() {
-					<-concurrency // 释放一个并发槽位
-					wg.Done()
-				}()
-				fmt.Printf("[%s] 正在执行任务...\n", hostInfo.IP)
-				for _, copyInfo := range copyFiles {
-					localPath, remotePath := splitPaths(copyInfo)
-					copyFileUsingSFTP(hostInfo, localPath, remotePath)
-				}
-				if cmd != "" {
-					checkHost(hostInfo, cmd)
-				}
-				fmt.Printf("[%s] 任务完成\n", hostInfo.IP)
-			}(host, runCommand, copyFiles)
-		}
-
-		// 等待所有任务完成
-		wg.Wait()
-		return nil
-	}
-
-	err := app.Run(os.Args)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if v, ok := groupVars[key]; ok { return v }
+	if v, ok := globalVars[key]; ok { return v }
+	return fallback
 }
 
-// 读取hosts文件并解析组信息
-func readHostsFile(filename string) (map[string][]HostInfo, error) {
-	groups := make(map[string][]HostInfo)
-	var currentGroup string
-
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// 跳过空行
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			// 解析组名
-			currentGroup = line[1 : len(line)-1]
-			groups[currentGroup] = []HostInfo{}
-		} else {
-			// 解析主机信息
-			parts := strings.Split(line, ":")
-			if len(parts) == 4 {
-				hostInfo := HostInfo{
-					IP:       parts[0],
-					Port:     parts[1],
-					Username: parts[2],
-					Password: parts[3],
-				}
-				groups[currentGroup] = append(groups[currentGroup], hostInfo)
+func flatten(inv Inventory, limit string) []Target {
+	var targets []Target
+	globalVars := inv.All.Vars
+	for gName, group := range inv.All.Groups {
+		groupVars := group.Vars
+		for ip, hostData := range group.Hosts {
+			if limit != "" && !strings.Contains(ip, limit) && !strings.Contains(gName, limit) {
+				continue
 			}
+			port := 22
+			pVal := getDeepVal(hostData, groupVars, globalVars, "port", 22)
+			switch v := pVal.(type) {
+			case int: port = v
+			case int64: port = int(v)
+			}
+			targets = append(targets, Target{
+				IP:       ip,
+				Port:     port,
+				User:     fmt.Sprintf("%v", getDeepVal(hostData, groupVars, globalVars, "user", "root")),
+				Password: fmt.Sprintf("%v", getDeepVal(hostData, groupVars, globalVars, "password", "")),
+			})
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return groups, nil
+	return targets
 }
 
-// 用于解析 copyFiles 的内容，并从中获取本地路径和远程路径。
-func splitPaths(copyInfo string) (string, string) {
-	parts := strings.Split(copyInfo, ":")
-	if len(parts) != 2 {
-		// 处理无效的格式
-		return "", ""
-	}
-	return parts[0], parts[1]
-}
+// --- 核心执行 ---
 
-// 基于sftp进行文件复制 -- copy主方法
-func copyFileUsingSFTP(hostInfo HostInfo, localFilePath, remoteFilePath string) {
-	fmt.Printf("Copying file %s to host: %s:%s\n", localFilePath, hostInfo.IP, remoteFilePath)
-
+func run(ctx context.Context, t Target, mode, src, dst, cmd, outputMode string) error {
 	config := &ssh.ClientConfig{
-		User: hostInfo.Username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(hostInfo.Password),
-		},
+		User:            t.User,
+		Auth:            []ssh.AuthMethod{ssh.Password(t.Password)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
 	}
 
-	// 建立SSH连接
-	client, err := ssh.Dial("tcp", hostInfo.IP+":"+hostInfo.Port, config)
-	if err != nil {
-		fmt.Printf("Failed to connect to %s: %v\n", hostInfo.IP, err)
-		return
-	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", t.IP, t.Port))
+	if err != nil { return err }
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, fmt.Sprintf("%s:%d", t.IP, t.Port), config)
+	if err != nil { return err }
+	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
 
-	// 创建SFTP客户端
-	sftpClient, err := sftp.NewClient(client)
-	if err != nil {
-		fmt.Printf("Failed to create SFTP client on %s: %v\n", hostInfo.IP, err)
-		return
-	}
-	defer sftpClient.Close()
-
-	// 打开本地文件
-	localFile, err := os.Open(localFilePath)
-	if err != nil {
-		fmt.Printf("Failed to open local file: %v\n", err)
-		return
-	}
-	defer localFile.Close()
-
-	// 创建远程文件
-	remoteFile, err := sftpClient.Create(remoteFilePath)
-	if err != nil {
-		fmt.Printf("Failed to create remote file on %s: %v\n", hostInfo.IP, err)
-		return
-	}
-	defer remoteFile.Close()
-
-	// 将本地文件拷贝到远程文件
-	_, err = io.Copy(remoteFile, localFile)
-	if err != nil {
-		fmt.Printf("Error copying file to %s: %v\n", hostInfo.IP, err)
-		return
+	if mode == "copy" {
+		sc, err := sftp.NewClient(client)
+		if err != nil { return err }
+		defer sc.Close()
+		return copyRecursive(sc, src, dst)
 	}
 
-	fmt.Printf("File %s copied to %s:%s\n", localFilePath, hostInfo.IP, remoteFilePath)
-}
-
-// 基于ssh执行主要命令或者脚本
-func checkHost(hostInfo HostInfo, cmd string) {
-	fmt.Printf("Checking host: %s\n", hostInfo.IP)
-	// 在这里执行与特定主机相关的巡检任务
-	// 可以使用 SSH 连接到主机并执行巡检脚本
-	// 例如，使用 golang.org/x/crypto/ssh 包来建立 SSH 连接和执行命令
-	config := &ssh.ClientConfig{
-		User: hostInfo.Username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(hostInfo.Password),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	// 建立 SSH 连接
-	client, err := ssh.Dial("tcp", hostInfo.IP+":"+hostInfo.Port, config)
-	if err != nil {
-		fmt.Printf("Failed to connect to %s: %v\n", hostInfo.IP, err)
-		return
-	}
-	defer client.Close()
-
-	// 执行巡检任务，例如执行远程命令
 	session, err := client.NewSession()
-	if err != nil {
-		fmt.Printf("Failed to create session on %s: %v\n", hostInfo.IP, err)
-		return
-	}
+	if err != nil { return err }
 	defer session.Close()
 
-	output, err := session.CombinedOutput(cmd)
-	if err != nil {
-		fmt.Printf("Error executing command on %s: %v\n", hostInfo.IP, err)
-		return
+	out, err := session.CombinedOutput(cmd)
+	if outputMode == "detail" && err == nil {
+		printSafe(fmt.Sprintf("\n✅ [%s] 输出:\n%s", t.IP, string(out)))
+	}
+	return err
+}
+
+func copyRecursive(sftpClient *sftp.Client, srcPath, dstPath string) error {
+	return filepath.Walk(srcPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil { return err }
+		relPath, _ := filepath.Rel(srcPath, path)
+		remotePath := filepath.ToSlash(filepath.Join(dstPath, relPath))
+		if info.IsDir() { return sftpClient.MkdirAll(remotePath) }
+		srcFile, err := os.Open(path)
+		if err != nil { return err }
+		defer srcFile.Close()
+		dstFile, err := sftpClient.Create(remotePath)
+		if err != nil { return err }
+		defer dstFile.Close()
+		_, err = io.Copy(dstFile, srcFile)
+		return sftpClient.Chmod(remotePath, info.Mode())
+	})
+}
+
+// 安全打印函数，处理进度条刷新
+func printSafe(msg string) {
+	printMutex.Lock()
+	defer printMutex.Unlock()
+	fmt.Print(msg)
+}
+
+func updateProgress(current, total int) {
+	printMutex.Lock()
+	defer printMutex.Unlock()
+	fmt.Printf("\r进度: [%d/%d] 成功:%d 失败:%d", current, total, atomic.LoadInt32(&successCount), atomic.LoadInt32(&failCount))
+}
+
+// --- 主程序 ---
+
+func main() {
+	invFile := flag.String("i", "inventory.yaml", "配置文件")
+	forks := flag.Int("f", 5, "并发数")
+	mode := flag.String("m", "exec", "模式 (exec/copy)")
+	src := flag.String("src", "", "源路径")
+	dst := flag.String("dst", "", "目标路径")
+	cmd := flag.String("a", "uptime", "命令")
+	outputMode := flag.String("o", "status", "输出模式 (status/detail)")
+	timeout := flag.Duration("t", 30*time.Second, "任务超时")
+	limit := flag.String("l", "", "过滤")
+	flag.Parse()
+
+	content, err := os.ReadFile(*invFile)
+	if err != nil { fmt.Println("无法读取配置"); return }
+	var inv Inventory
+	yaml.Unmarshal(content, &inv)
+	targets := flatten(inv, *limit)
+	total := len(targets)
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, *forks)
+
+	fmt.Printf("🚀 Gosible v2.0 | 模式: %s | 目标: %d\n", *mode, total)
+
+	for _, t := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(target Target) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+
+			err := run(ctx, target, *mode, *src, *dst, *cmd, *outputMode)
+			
+			if err == nil {
+				atomic.AddInt32(&successCount, 1)
+			} else {
+				atomic.AddInt32(&failCount, 1)
+				printSafe(fmt.Sprintf("\n❌ [%s:%d] 失败: %v", target.IP, target.Port, err))
+			}
+
+			if *outputMode == "status" {
+				updateProgress(int(atomic.LoadInt32(&successCount)+atomic.LoadInt32(&failCount)), total)
+			}
+		}(t)
+		if *forks == 1 { wg.Wait() }
 	}
 
-	fmt.Printf("Result from %s:\n%s\n", hostInfo.IP, string(output))
+	wg.Wait()
+	fmt.Printf("\n\n🏁 任务汇总: 成功 %d, 失败 %d, 总数 %d\n", successCount, failCount, total)
 }

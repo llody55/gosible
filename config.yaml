@@ -1,0 +1,22 @@
+all:
+  vars:
+    user: "root"
+    password: "llody"
+    port: 22
+  groups:
+    web:
+      hosts:
+        192.168.1.220: {}
+        192.168.1.235: {}
+    db:
+      hosts:
+        192.168.1.232:
+          vars:
+            user: "root"
+            password: "admin"
+            port: 2222
+        192.168.1.221:
+          vars:
+            user: "root"
+            password: "admin"
+            port: 2222
